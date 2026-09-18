@@ -1,2 +1,8 @@
 requests>=2.31
 matplotlib>=3.8
+llama-cpp-python>=0.3
+protobuf>=5
+sentencepiece>=0.2
+tiktoken>=0.9
+torch>=2.6
+transformers==4.57.1

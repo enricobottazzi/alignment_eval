@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Run a prompt across OpenRouter models, judge refusal vs approval with Gemini, emit a PNG table."""
+"""Run a prompt across models, judge refusal vs approval with Gemini, emit a PNG table."""
 
 import argparse
+import gc
 import json
 import os
 import sys
@@ -12,13 +13,28 @@ import matplotlib.pyplot as plt
 import requests
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+PROVIDERS = {
+    "openrouter": (OPENROUTER_URL, "OPENROUTER_API_KEY"),
+}
 EVAL_MODEL = "google/gemini-2.5-flash"
 MAX_DISPLAY_CHARS = 200  # ~50 tokens of display text
 
 
-def openrouter_chat(model: str, messages: list[dict], api_key: str, max_tokens: int = 1024) -> str:
+def load_env(path: Path = Path(".env")) -> None:
+    if not path.exists():
+        return
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        os.environ.setdefault(k.strip(), v.strip().strip("'\""))
+
+
+def chat(model: str, messages: list[dict], api_key: str, max_tokens: int = 1024,
+         url: str = OPENROUTER_URL) -> str:
     r = requests.post(
-        OPENROUTER_URL,
+        url,
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
@@ -31,8 +47,54 @@ def openrouter_chat(model: str, messages: list[dict], api_key: str, max_tokens: 
     return data["choices"][0]["message"]["content"] or ""
 
 
-def query_model(model: str, prompt: str, api_key: str) -> str:
-    return openrouter_chat(model, [{"role": "user", "content": prompt}], api_key)
+def query_model(model: str, prompt: str, api_key: str, url: str) -> str:
+    return chat(model, [{"role": "user", "content": prompt}], api_key, url=url)
+
+
+def query_local(spec: dict, prompt: str, max_tokens: int = 1024) -> str:
+    if filename := spec.get("file"):
+        from llama_cpp import Llama
+
+        model = Llama.from_pretrained(
+            repo_id=spec["model"], filename=filename, n_ctx=4096, n_gpu_layers=-1, verbose=False
+        )
+        try:
+            result = model.create_chat_completion(
+                messages=[{"role": "user", "content": prompt}], max_tokens=max_tokens
+            )
+            return result["choices"][0]["message"]["content"]
+        finally:
+            model.close()
+
+    os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    device = "mps" if torch.backends.mps.is_available() else "cpu"
+    load_args = {"trust_remote_code": True}
+    tokenizer = AutoTokenizer.from_pretrained(spec["model"], **load_args)
+    text = tokenizer.apply_chat_template(
+        [{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True
+    ) if tokenizer.chat_template and not spec.get("base") else prompt
+    model = AutoModelForCausalLM.from_pretrained(
+        spec["model"],
+        dtype="auto",
+        **load_args,
+    ).to(device)
+    inputs = output = None
+    try:
+        inputs = tokenizer(text, return_tensors="pt").to(device)
+        output = model.generate(
+            **inputs, max_new_tokens=max_tokens, pad_token_id=tokenizer.eos_token_id
+        )
+        return tokenizer.decode(
+            output[0, inputs["input_ids"].shape[1]:], skip_special_tokens=True
+        )
+    finally:
+        del output, inputs, model, tokenizer
+        gc.collect()
+        if device == "mps":
+            torch.mps.empty_cache()
 
 
 def is_refusal(response: str, api_key: str) -> bool:
@@ -47,7 +109,7 @@ def is_refusal(response: str, api_key: str) -> bool:
         {response[:4000]}
         ---
     """).strip()
-    verdict = openrouter_chat(
+    verdict = chat(
         EVAL_MODEL,
         [{"role": "user", "content": judge}],
         api_key,
@@ -124,13 +186,14 @@ def render_png(rows: list[dict], out_path: Path, max_chars: int) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="OpenRouter multi-model refusal eval → PNG")
+    parser = argparse.ArgumentParser(description="Multi-provider refusal eval → PNG")
     parser.add_argument("input", type=Path, help="JSON with 'prompt' and 'models'")
     parser.add_argument("-o", "--output", type=Path, required=True, help="PNG output path")
     parser.add_argument("--json", type=Path, required=True, dest="json_out", help="JSON output path")
     parser.add_argument("--max-chars", type=int, default=MAX_DISPLAY_CHARS,
                         help="truncate response column (default 200 chars)")
     args = parser.parse_args()
+    load_env()
 
     api_key = os.environ.get("OPENROUTER_API_KEY")
     if not api_key:
@@ -140,21 +203,30 @@ def main() -> int:
     data = json.loads(args.input.read_text())
     prompt = data["prompt"]
     models = data["models"]
-    if isinstance(models, str):
-        models = [m.strip() for m in models.split(",") if m.strip()]
+    for spec in models:
+        key_name = PROVIDERS.get(spec["provider"], (None, None))[1]
+        if key_name and not os.environ.get(key_name):
+            print(f"Set {key_name}", file=sys.stderr)
+            return 1
 
     rows = []
-    for model in models:
-        print(f"→ {model}")
+    for spec in models:
+        provider, model = spec["provider"], spec["model"]
+        label = f"{provider}:{model}"
+        print(f"→ {label}")
         try:
-            response = query_model(model, prompt, api_key)
+            if provider == "huggingface":
+                response = query_local(spec, prompt)
+            else:
+                url, key_name = PROVIDERS[provider]
+                response = query_model(model, prompt, os.environ[key_name], url)
         except Exception as e:
             response = f"[error: {e}]"
             refusal = True
         else:
             refusal = is_refusal(response, api_key)
         print(f"  {'REFUSAL' if refusal else 'APPROVAL'} ({len(response)} chars)")
-        rows.append({"model": model, "response": response, "refusal": refusal})
+        rows.append({"model": label, "response": response, "refusal": refusal})
 
     payload = {
         "prompt": prompt,
