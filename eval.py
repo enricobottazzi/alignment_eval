@@ -101,6 +101,24 @@ def render_png(rows: list[dict], out_path: Path, max_chars: int) -> None:
             cell.set_text_props(weight="bold")
 
     fig.tight_layout()
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    for cell in table.get_celld().values():
+        text = cell.get_text()
+        value = text.get_text()
+        width = cell.get_window_extent(renderer).width * (1 - 2 * cell.PAD)
+        measure = lambda s: renderer.get_text_width_height_descent(
+            s, text.get_fontproperties(), False
+        )[0]
+        if measure(value) > width:
+            lo, hi = 0, len(value)
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                if measure(value[:mid] + "…") <= width:
+                    lo = mid
+                else:
+                    hi = mid - 1
+            text.set_text(value[:lo] + "…")
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
