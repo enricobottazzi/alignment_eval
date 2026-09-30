@@ -181,7 +181,8 @@ def render_png(rows: list[dict], out_path: Path, max_chars: int) -> None:
                 else:
                     hi = mid - 1
             text.set_text(value[:lo] + "…")
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    bbox = table.get_window_extent(renderer).transformed(fig.dpi_scale_trans.inverted())
+    fig.savefig(out_path, dpi=150, bbox_inches=bbox.padded(0.08))
     plt.close(fig)
 
 
